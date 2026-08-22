@@ -152,11 +152,8 @@ def engineer_OrderBook_features(df: pl.DataFrame) -> pl.DataFrame:
     # drop the incomplete edge rows before filling nulls
     # we explcitly drops the rows where out maximum look-back or look-forward generated a null. 
     feature_df = feature_df.drop_nulls(subset=["obi_velocity_30s", "forward_book_return"])
-    
-    # fill empty entries with a neutral score of 0.0
-    # NOTE: This will also clean up the initial nulls created by .shift() and .rolling_std()
-    feature_df = feature_df.fill_null(0.0)
-    
+    feature_df = feature_df.fill_null(0.0).fill_nan(0.0) 
+        
     print("\n---- Feature engineering completed ----")
     return feature_df
 

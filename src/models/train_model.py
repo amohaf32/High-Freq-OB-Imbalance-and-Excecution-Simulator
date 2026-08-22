@@ -22,9 +22,14 @@ import os
 import polars as pl
 import matplotlib.pyplot as plt
 import xgboost as xgb
+import numpy as np
 from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, accuracy_score 
+from sklearn.preprocessing import StandardScaler
+
+# Silence false Apple Accelerate BLAS CPU flags in NumPy 2.x
+np.seterr(all='ignore')
 
 def load_and_split_data():
     print("Loading serialized feature matrix...")
@@ -72,7 +77,7 @@ def train_baseline_model(train_df: pl.DataFrame, test_df: pl.DataFrame):
     # intializing the logistic regression model 
     # the multi_class wil be multinomial since we have 3 classes to predict (buy, sell, hold)
     
-    baseline_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', random_state=42) 
+    baseline_model = LogisticRegression(solver='lbfgs', random_state=42) 
     
     # fit(train) the model using only the hstorical training data 
     print("Fitting Logistic Regression to Training data")
@@ -205,6 +210,196 @@ def evaluate_naive_benchmark(test_df: pl.DataFrame):
     print(classification_report(y_test, y_pred, zero_division=0))
     print("--------------------------------------------------\n")
 
+# during the training of the baseline model we trained the multinomial logistic regression on 1 feature (obi_0.2)
+# but now that we have trained an advanced xgboost model (xgbosst categorical classifier) which is a complex model, 
+# it takes more CPU/GPU microseconds to evaluate than a linear model. So the objective for this task is to evaluate 
+# the performance vs latency trade-off. 
+# for this we will now train the multinomial logistic regression on all the 11 features. 
+
+def train_full_logistic_model(train_df: pl.DataFrame, test_df: pl.DataFrame):
+    print("\n--- INITIATING STATISTICAL BENCHMARK (FULL FEATURE LOGISTIC REGRESSION) ---")
+
+    #1. Mapping the complete feature matrix (all 11 of them)
+    features = [
+        "obi_0.2", "obi_1.0", "obi_2.0", "obi_3.0", "obi_5.0",
+        "obi_global_weighted", "liquidity_width",
+        "obi_velocity_5s", "obi_velocity_10s", "obi_velocity_30s",
+        "obi_volatility_10s"
+    ]
+
+    target = "target_label"
+
+    print(f"Feeding all {len(features)} engineered features to Multinomial Logistic Regression")
+
+    #2. Extracting arrays from Polars 
+    X_train = train_df.select(features).to_numpy()
+    y_train = train_df.select(target).to_numpy().ravel()
+
+    X_test = test_df.select(features).to_numpy()
+    y_test = test_df.select(target).to_numpy().ravel()
+
+    #3. Convert any lingering NaN, +inf, or -inf into 0.0
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+
+    #4. Standarize feature scales (Zero mean, unit variance)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test) #Note - fit on train, transform test to avoid data leakage 
+
+    #5. Clipping extreme Z-score outliers to [-5.0, 5.0]
+
+    X_train_scaled = np.clip(X_train_scaled, -5.0, 5.0)
+    X_test_scaled = np.clip(X_test_scaled, -5.0, 5.0)
+
+    #4. Fit the Multinomial Linear Regression 
+    full_log_model = LogisticRegression(solver='liblinear', C=0.1 ,max_iter=1000, random_state=42) 
+    
+    # the C=0.1 is to penalize multicollinearity and stop weight explosion
+    # before when i was running the function without the C=0.1 parameter i was getting this error : 
+    # RuntimeWarning: divide by zero encountered in matmul
+    # this happened because of the multicollinearity between the 11 features, in other words 6 out of 11 features 
+    # has a high collinearity 
+    # so in order to avoid getting this error i introduced the C=0.1 parameter which penalize multicollinearity 
+    # and stop weight explosion. 
+
+    """
+    the following is what gemini has to give as an explanation for the above mentioned RuntimeWarning: 
+    
+    1. Collinear Features: 6 of your 11 features (obi_0.2, obi_1.0, obi_2.0, obi_3.0, obi_5.0, obi_global_weighted) 
+    measure the exact same market force—buying vs. selling pressure—at slightly different depth layers. 
+    They are highly correlated.
+    
+    2. Weight Explosion: When LogisticRegression with the default setting (C=1.0) attempts to fit highly correlated 
+    features, the un-regularized optimizer (L-BFGS) pits the features against each other. 
+    It assigns massive positive weights to one level (+10,000) and massive negative weights to another (−10,000).
+
+    3. Softmax Overflow: During matrix multiplication (X @ weights.T), multiplying inputs by these exploded weight 
+    vectors creates numbers like +1,000. When scikit-learn exponentiates these in the softmax function (e^1000), it 
+    exceeds 64-bit floating-point memory limits, triggering the overflow and divide by zero warnings.
+    """
+    # so after adding this C=0.1 parameter the absolute accuracy changed from 29.55% to 30.50% for this particular model
+    # but the runtimewarning for the matmul still presists. 
+    #asking gemini this is what i can understand 
+
+    """
+    in high-frequency order book data, market spikes occur(eg. liquidity_width or obi_velocity suddenly jumping during a 
+    volatility burst)
+
+    when standardscaler() standardizes this sudden spike, it creates massive z-scores (eg. +500 or +1000) 
+    standard deviations 
+
+    finally whne LogisticRegression evaluates X @ weights.T, multiplying a +500 z-score by weight vectors casues 
+    sk-learn's inital internal matrix math (e^500xW) to overflow the 64-bit float limit.
+
+    so the suggested solution to this fix is to prevent extreme market spikes from exploding matrix multiplication, 
+    where clipping the sclaed z-scores to a clean range like [-5.0,5.0] (capping the features within 5 
+    standard deviations) and then apply np.nan_to_num after scaling
+    """
+
+    # so after doing the change it didnt prevent the warning but what i could see as an improvement was the fact 
+    # that the precision score has changed in the -1.0 and weighted avg from the last time i ran the code.
+    # again asking gemini this is what it said : 
+
+    """ 
+    You are running Python 3.13 with NumPy 2.x on macOS.
+
+    Intermediate Trial Steps: During full_log_model.fit(), the L-BFGS optimization algorithm tests candidate weight 
+    vectors to find the mathematical minimum.
+
+    NumPy 2.0 BLAS Flag: During some of these temporary trial steps, intermediate dot products (X @ weights.T) 
+    briefly produce large values. NumPy 2.0 on macOS (using Apple Accelerate BLAS) detects these trial values 
+    and emits a RuntimeWarning.
+
+    Normal Convergence: L-BFGS immediately rejects those trial steps, corrects course, and converges cleanly to 
+    the final model (which is why your precision and accuracy updated successfully to 30.50%!).
+
+    These are harmless internal solver trial warnings. In Python/scikit-learn, it is standard practice to suppress 
+    intermediate optimizer warnings around .fit().
+    """
+
+    # when i asked i want to try and fix these warning this is what it said : 
+
+    """
+    Why lbfgs Keeps Warning and How to Fix It 100%
+
+    solver='lbfgs' in scikit-learn 1.5+ routes through an internal Python module named: 
+    sklearn.linear_model._linear_loss.py. 
+    
+    During optimization, it uses NumPy's @ (matmul) matrix operator in pure Python, which triggers RuntimeWarnings 
+    on Python 3.13 / NumPy 2.0 during line-search steps.
+
+    The Permanent Solution: Switch to a C-Compiled Solver (liblinear or saga)
+    By changing the solver to solver='liblinear' (or solver='saga'):
+
+    1. Optimization is handled by C/C++ compiled binaries (LIBLINEAR / SAGA).
+    2. It completely bypasses _linear_loss.py and pure Python NumPy matrix operations.
+    3. Result: 100% warning-free execution with high numerical precision and speed!
+    """
+
+    # so i got the _linear_loss.py warning fixed but then the following warning persisted which came from the extmath.py
+    """
+    /opt/anaconda3/envs/conda-env/lib/python3.13/site-packages/sklearn/utils/extmath.py:205: 
+    RuntimeWarning: divide by zero encountered in matmul
+    ret = a @ b
+    /opt/anaconda3/envs/conda-env/lib/python3.13/site-packages/sklearn/utils/extmath.py:205: 
+    RuntimeWarning: overflow encountered in matmul
+    ret = a @ b
+    /opt/anaconda3/envs/conda-env/lib/python3.13/site-packages/sklearn/utils/extmath.py:205: 
+    RuntimeWarning: invalid value encountered in matmul
+    ret = a @ b
+    """
+
+    # and from what i could understand from gemini explanation this error comes from the exthmath.py whihc is called 
+    # by StandardScaler.fit_transform(X_train)
+
+    """
+    Why extmath.py Warned:
+
+    StandardScaler calculates dot products (a @ b) on X_train. Because np.nan_to_num(X_train) was placed after 
+    scaler.fit_transform(), StandardScaler was calculating matrix statistics on the uncleaned raw X_train array 
+    containing raw inf values.
+
+    The Fix: Clean X_train BEFORE StandardScaler
+    Place np.nan_to_num BEFORE scaler.fit_transform(X_train).
+    """
+
+    # the warning did not go away after all changes i made and the conclusion that gemini came was due to : 
+    # running Python 3.13 with NumPy 2.x on an Apple Silicon Mac (M1/M2/M3/M4).
+
+    # The Technical Cause:
+    # NumPy 2.0 + Apple Accelerate BLAS: On macOS arm64, NumPy 2.x links against Apple's Accelerate.framework 
+    # BLAS library for matrix multiplication (a @ b).
+    # False BLAS Floating-Point Exception: Apple Accelerate's low-level C/assembly GEMM matrix multiplication 
+    # routine sets internal CPU floating-point status flags during matrix dot products. NumPy 2.0's error-checking 
+    # layer catches these CPU hardware flags and emits a false RuntimeWarning: divide by zero encountered 
+    # in matmul—even when all numbers in the matrix are 100% clean and finite!
+    # Location in Code: It happens inside extmath.py:205 when predict() computes a @ b (X_test_scaled @ coef_.T).
+    # Because this is a hardware-level BLAS CPU flag in NumPy 2.x on macOS, no amount of data cleaning will 
+    # prevent Apple's Accelerate BLAS from setting that CPU flag during a @ b.
+
+    # I also cross-checked this error via the old method stackoverflow and github forum and people with similar problem
+    # said the same as gemini its due to macOS M4 https://github.com/numpy/numpy/issues/28687
+    # so temp solution is to turn off all the warning related to this Apple Accelerate BLAS CPU flags by doign this :
+    #np.seterr(all='ignore')
+
+
+    print("Fitting Full-feature Logistic Regression to Trianing data")
+    full_log_model.fit(X_train_scaled, y_train)
+
+    #5. Predicting on unseen data 
+    y_pred = full_log_model.predict(X_test_scaled)
+
+    #6. Accuracy and Evaluation Metrics
+    accuracy = accuracy_score(y_test, y_pred)
+
+    print("\n--- FULL FEATURE LOGISTIC REGRESSION PERFORMANCE (OUT-OF-SAMPLE) ---")
+    print(f"Absolute Accuracy: {accuracy * 100:.2f}%\n")
+    print("Detailed Classification Report:")
+    print(classification_report(y_test, y_pred, zero_division=0))
+    print("--------------------------------------------------\n")
+    
+    
 
 if __name__ == "__main__":
     # Execute the split
@@ -234,3 +429,6 @@ if __name__ == "__main__":
 
     # Naive Benchmark Heuristic
     evaluate_naive_benchmark(test_data)
+
+    # Full feature Logistic regression
+    train_full_logistic_model(train_data, test_data)

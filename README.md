@@ -15,6 +15,13 @@ The framework is decoupled into three core pillars:
 
 ---
 
+## Acknowledgments & AI Assistance
+
+- **Architecture & Roadmap:** The implementation roadmap, structural design, and step-by-step task breakdown were structured and written with theoretical guidance and formula derivations assisted by Google Gemini.
+- **Development & Execution:** All code, signal processing pipelines, model training, and event-driven backtesting logic were independently implemented based on this design.
+
+---
+
 ## Comprehensive Implementation Roadmap (Task-by-Task)
 
 ### Module 1: Environment Setup & High-Throughput Data Ingestion
